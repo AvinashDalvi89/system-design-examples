@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Self-hosted prerender.io replacement.
+  Puppeteer renderer on Lambda + S3 cache + API Gateway + custom domain.
+  Deploy AFTER building and pushing the Docker image to ECR.
+  Region: ap-south-1 (or any region — NOT us-east-1, that's for Lambda@Edge separately)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPLOY:
+#   aws cloudformation deploy \
+#     --template-file cloudformation/renderer.yaml \
+#     --stack-name nushiftconnect-prerender \
+#     --region ap-south-1 \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides \
+#         ECRImageUri=279246227274.dkr.ecr.ap-south-1.amazonaws.com/nushiftconnect-renderer:latest \
+#         DomainName=precache.nushiftconnect.com \
+#         HostedZoneId=Z094768014DMZJTN01RH9 \
+#         InternalToken=YOUR_SECRET_TOKEN \
+#         SiteUrl=https://nushiftconnect.com
+# ─────────────────────────────────────────────────────────────────────────────
+
+Parameters:
+
+  ECRImageUri:
+    Type: String
+    Description: >
+      Full ECR image URI including tag.
+      Build with: docker build --platform linux/amd64 --provenance=false -t renderer .
+      Push with:  docker push <account>.dkr.ecr.<region>.amazonaws.com/nushiftconnect-renderer:latest
+
+  DomainName:
+    Type: String
+    Default: precache.nushiftconnect.com
+    Description: Custom subdomain that CloudFront (Lambda@Edge) routes bot requests to
+
+  HostedZoneId:
+    Type: String
+    Description: Route 53 Hosted Zone ID for the apex domain (e.g. nushiftconnect.com)
+
+  InternalToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      Secret token shared between Lambda@Edge and this renderer.
+      Lambda@Edge sends it as X-Prerender-Token header.
+      Renderer rejects requests that don't include it.
+      Generate with: openssl rand -hex 32
+
+  SiteUrl:
+    Type: String
+    Default: https://nushiftconnect.com
+    Description: The Angular app URL Puppeteer will open and render
+
+  CacheTTLHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: How long rendered HTML is cached in S3 before re-rendering (hours)
+
+  LambdaMemoryMB:
+    Type: Number
+    Default: 2048
+    AllowedValues: [2048, 3008, 4096, 5120, 6144, 7168, 8192, 9216, 10240]
+    Description: >
+      Lambda memory. Chromium needs at least 2048MB.
+      More memory = faster renders but higher cost per invocation.
+
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── S3 Cache Bucket ─────────────────────────────────────────────────────────
+  CacheBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain  # keep cache if stack is deleted accidentally
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-cache'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldCache
+            Status: Enabled
+            # Belt-and-suspenders: S3 deletes objects older than 7 days
+            # regardless of our TTL check in Lambda
+            ExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: prerender-replacement
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── IAM Role for Renderer Lambda ────────────────────────────────────────────
+  RendererRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-renderer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3CacheAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${CacheBucket.Arn}/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub >-
+                  arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-renderer:*
+
+  # ── Renderer Lambda Function ────────────────────────────────────────────────
+  RendererFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-renderer'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ECRImageUri
+      Role: !GetAtt RendererRole.Arn
+      MemorySize: !Ref LambdaMemoryMB
+      Timeout: 30  # matches Lambda@Edge readTimeout max
+      Environment:
+        Variables:
+          CACHE_BUCKET: !Ref CacheBucket
+          CACHE_TTL_HOURS: !Ref CacheTTLHours
+          INTERNAL_TOKEN: !Ref InternalToken
+          SITE_URL: !Ref SiteUrl
+      Tags:
+        - Key: Project
+          Value: prerender-replacement
+
+  # ── API Gateway HTTP API ─────────────────────────────────────────────────────
+  # Using HTTP API (not REST API): cheaper, simpler, Lambda proxy integration
+  RendererApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-renderer'
+      ProtocolType: HTTP
+      Tags:
+        Project: prerender-replacement
+
+  RendererIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RendererApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt RendererFunction.Arn
+      PayloadFormatVersion: '2.0'  # v2.0 = Lambda receives full event, returns statusCode/body/headers
+
+  # Catch-all route: /article/x, /posts/y, /questions/z etc.
+  RendererRouteProxy:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RendererApi
+      RouteKey: 'ANY /{proxy+}'
+      Target: !Sub 'integrations/${RendererIntegration}'
+
+  # Root route: /
+  RendererRouteRoot:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RendererApi
+      RouteKey: 'ANY /'
+      Target: !Sub 'integrations/${RendererIntegration}'
+
+  RendererStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref RendererApi
+      StageName: '$default'
+      AutoDeploy: true  # any route/integration change deploys automatically
+      Tags:
+        Project: prerender-replacement
+
+  # Allow API Gateway to invoke the Lambda
+  RendererLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RendererFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RendererApi}/*/*'
+
+  # ── TLS Certificate ──────────────────────────────────────────────────────────
+  # Must be in SAME region as API Gateway (ap-south-1 for regional endpoint)
+  # CloudFormation automatically creates Route 53 validation records
+  RendererCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Project
+          Value: prerender-replacement
+
+  # ── API Gateway Custom Domain ────────────────────────────────────────────────
+  RendererCustomDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref RendererCertificate
+          EndpointType: REGIONAL
+      Tags:
+        Project: prerender-replacement
+
+  RendererApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    DependsOn: RendererStage
+    Properties:
+      ApiId: !Ref RendererApi
+      DomainName: !Ref RendererCustomDomain
+      Stage: '$default'
+
+  # ── Route 53 DNS Record ──────────────────────────────────────────────────────
+  RendererDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt RendererCustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt RendererCustomDomain.RegionalHostedZoneId
+        EvaluateTargetHealth: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+
+  CacheBucketName:
+    Value: !Ref CacheBucket
+    Description: S3 bucket storing cached rendered HTML
+
+  RendererApiEndpoint:
+    Value: !GetAtt RendererApi.ApiEndpoint
+    Description: Raw API Gateway URL (use for smoke testing)
+
+  RendererUrl:
+    Value: !Sub 'https://${DomainName}'
+    Description: Custom domain URL — use this in Lambda@Edge as the origin domainName
+
+  InternalTokenReminder:
+    Value: !Sub >-
+      Set X-Prerender-Token header in Lambda@Edge socialbots function to the
+      InternalToken parameter value, and set Host header to ${DomainName}
+    Description: Lambda@Edge configuration reminder
+
+  UpdateLambdaEdgeCommand:
+    Value: !Sub >-
+      After deploying, update socialbots Lambda@Edge: set domainName to ${DomainName},
+      add request.headers['host'] = [{key:'Host',value:'${DomainName}'}],
+      add customHeaders x-prerender-token with your InternalToken value.
+      Then publish new version and update CloudFront behavior ARN.
+    Description: Manual step required after stack deployment
