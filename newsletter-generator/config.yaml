@@ -1,0 +1,71 @@
+newsletter:
+  name: "AWS for Product Builder"
+  author: "Avinash Dalvi"
+  issue_number: 9  # increment each month before running
+
+audience:
+  description: >
+    Product builders — founders and engineers building SaaS products and startups on AWS.
+    They care about containers (ECS, Fargate, ECR), serverless (Lambda, API Gateway, EventBridge),
+    developer experience, cost optimization, and shipping fast without heavy ops overhead.
+
+blog:
+  rss_url: "https://internetkatta.com/feed"
+  days_back: 35
+
+reddit:
+  subreddits:
+    - aws
+    - serverless
+    - awscertifications
+  time_filter: month  # hour | day | week | month | year | all
+  limit: 40
+
+devto:
+  tags:
+    - aws
+    - serverless
+    - containers
+    - ecs
+    - lambda
+    - fargate
+  days_back: 35
+  per_page: 50
+
+aws_news:
+  keywords:
+    - ECS
+    - Fargate
+    - Lambda
+    - Serverless
+    - Container
+    - ECR
+    - EKS
+    - API Gateway
+    - AppRunner
+    - "Step Functions"
+    - CloudFront
+    - DynamoDB
+    - RDS
+    - Aurora
+    - Copilot
+  days_back: 35
+
+github:
+  queries:
+    - "topic:aws topic:serverless"
+    - "topic:aws topic:lambda"
+    - "topic:aws topic:ecs"
+    - "topic:aws topic:fargate"
+    - "aws-cdk serverless"
+  min_stars: 30
+  days_back: 60
+  max_repos: 25
+
+output:
+  # How many items to include per section in the draft (you remove what you don't want)
+  max_aws_news: 12
+  max_community: 10
+  max_reddit: 10
+  max_repos: 8
+  draft_dir: "."
